@@ -19,7 +19,7 @@ const SESSION_BASE_PATH = path.join(__dirname, 'sessions');
 
 let activeSockets = {};
 let sessionTimers = {};
-let connectionTimers = {}; // New timer for tracking connection time
+let connectionTimers = {};
 let mongoClient = null;
 let mongooseConnection = null;
 let restartCount = 0;
@@ -29,9 +29,9 @@ if (!fs.existsSync(SESSION_BASE_PATH)) {
     fs.mkdirSync(SESSION_BASE_PATH, { recursive: true });
 }
 
-// Mongoose Session Schema
+// Mongoose Session Schema - Fixed: sparse unique index
 const SessionSchema = new mongoose.Schema({
-    number: { type: String, unique: true, required: true },
+    number: { type: String, unique: true, sparse: true, required: false },
     lid: { type: String },
     creds: { type: Object, required: true },
     config: { type: Object },
@@ -60,6 +60,25 @@ async function connectMongoDB() {
         });
         mongooseConnection = mongoose.connection;
         console.log('MongoDB connected successfully via Mongoose');
+        
+        // Drop the old index if it exists and create sparse one
+        try {
+            await mongooseConnection.db.collection('sessions').dropIndex('number_1');
+            console.log('Dropped existing number_1 index');
+        } catch (err) {
+            console.log('Index drop skipped or not found:', err.message);
+        }
+        
+        try {
+            await mongooseConnection.db.collection('sessions').createIndex(
+                { number: 1 }, 
+                { sparse: true, unique: true }
+            );
+            console.log('Created sparse unique index on number field');
+        } catch (err) {
+            console.log('Index creation skipped:', err.message);
+        }
+        
     } catch (error) {
         console.error('MongoDB connection failed:', error);
         throw error;
@@ -128,20 +147,24 @@ function fixCredsBuffers(obj) {
     return obj;
 }
 
-// Session save function - Modified to check 10-second rule
+// Session save function - Fixed to handle null numbers
 async function saveSession(number, creds, lid = null, force = false) {
     try {
-        const sanitizedNumber = number.replace(/[^0-9]/g, '');
-        if (!sanitizedNumber) return;
+        const sanitizedNumber = number ? number.replace(/[^0-9]/g, '') : null;
+        
+        // If no number and no lid, skip saving
+        if (!sanitizedNumber && !lid) {
+            console.log(`[Session Manager] No number or lid provided, skipping save`);
+            return;
+        }
 
         // force = true නම් හෝ connection එක තත්පර 10කට වඩා පැරණි නම් save කරන්න
-        if (!force) {
+        if (!force && sanitizedNumber) {
             const timerKey = `save_${sanitizedNumber}`;
             if (connectionTimers[timerKey]) {
                 const elapsed = Date.now() - connectionTimers[timerKey].startTime;
                 if (elapsed < 10000) {
                     console.log(`[Session Manager] Waiting for 10 seconds before saving session for ${sanitizedNumber} (${elapsed}ms elapsed)`);
-                    // තවමත් save නොකරන්න
                     return;
                 }
             } else {
@@ -153,26 +176,47 @@ async function saveSession(number, creds, lid = null, force = false) {
         const credsString = typeof creds === 'string' ? creds : JSON.stringify(creds, BufferJSON.replacer);
         const credsObj = JSON.parse(credsString);
 
-        const updateFields = { number: sanitizedNumber, creds: credsObj, updatedAt: new Date() };
+        const updateFields = { creds: credsObj, updatedAt: new Date() };
+        
+        // Only add number if it exists
+        if (sanitizedNumber) {
+            updateFields.number = sanitizedNumber;
+        }
+        
         if (lid) {
             updateFields.lid = lid.replace(/[^0-9]/g, '');
         }
 
+        // Use a query that matches by number or lid
+        const query = {};
+        if (sanitizedNumber) {
+            query.number = sanitizedNumber;
+        } else if (lid) {
+            query.lid = lid.replace(/[^0-9]/g, '');
+        } else {
+            // If no identifier, use a temporary ID from creds
+            const tempId = credsObj?.me?.id?.split(':')[0] || Date.now().toString();
+            query.number = tempId;
+            updateFields.number = tempId;
+        }
+
         await Session.findOneAndUpdate(
-            { number: sanitizedNumber },
+            query,
             { $set: updateFields },
             { upsert: true, returnDocument: 'after' }
         );
-        console.log(`[Session Manager] Saved session for ${sanitizedNumber} to MongoDB successfully.`);
+        console.log(`[Session Manager] Saved session for ${sanitizedNumber || 'unknown'} to MongoDB successfully.`);
 
-        const sessionPath = path.join(SESSION_BASE_PATH, `Bot_${sanitizedNumber}`);
-        if (!fs.existsSync(sessionPath)) {
-            fs.mkdirSync(sessionPath, { recursive: true });
+        if (sanitizedNumber) {
+            const sessionPath = path.join(SESSION_BASE_PATH, `Bot_${sanitizedNumber}`);
+            if (!fs.existsSync(sessionPath)) {
+                fs.mkdirSync(sessionPath, { recursive: true });
+            }
+            fs.writeFileSync(path.join(sessionPath, 'creds.json'), JSON.stringify(creds, null, 2));
         }
-        fs.writeFileSync(path.join(sessionPath, 'creds.json'), JSON.stringify(creds, null, 2));
 
     } catch (error) {
-        console.error(`[Session Manager] Error saving session for ${number}:`, error.message);
+        console.error(`[Session Manager] Error saving session for ${number || 'unknown'}:`, error.message);
     }
 }
 
@@ -265,6 +309,10 @@ async function useMongoDBAuthState(collection, sessionId) {
                     } else {
                         console.log(`[${mainSessionId}] Not saving yet - only ${elapsed}ms elapsed`);
                     }
+                } else {
+                    // If timer doesn't exist, save anyway (for reconnect scenarios)
+                    console.log(`[${mainSessionId}] No timer found, saving session directly`);
+                    await saveSession(phoneNumber, cleanData.creds, null, true);
                 }
             }
             
@@ -403,7 +451,7 @@ async function useMongoDBAuthState(collection, sessionId) {
     };
 }
 
-// UPDATED: New sendSuccessMessage function with image and multi-language support
+// Updated sendSuccessMessage function with image and multi-language support
 async function sendSuccessMessage(sock, jid) {
     try {
         // Wait 2 seconds just to ensure the socket is fully ready to transmit
