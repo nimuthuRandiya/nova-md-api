@@ -459,15 +459,15 @@ async function sendSuccessMessage(sock, jid) {
             const imageUrl = "https://cdn.phototourl.com/free/2026-08-18-a18634f6-91e2-454e-877b-92ca61570125.png";
             const messageText = 
                 "✅ *WhatsApp Bot Connected Successfully!*\n\n" +
-                "⏳ Please wait about 30 seconds, then type `.menu` to check if the bot is working.\n" +
+                "⏳ Please wait about 60 seconds, then type `.menu` to check if the bot is working.\n" +
                 "⚠️ If the bot does not connect within 5 minutes, please unlink/log out the device from WhatsApp Linked Devices and try again.\n\n" +
                 "----------------------------------------\n\n" +
                 "✅ *වට්ස්ඇප් බොට් සාර්ථකව සම්බන්ධ විය!*\n\n" +
-                "⏳ කරුණාකර තත්පර 30ක් පමණ රැදී සිට, බොට් වැඩ කරන්නේ දැයි බැලීමට `.menu` ලෙස යවන්න.\n" +
+                "⏳ කරුණාකර තත්පර 60ක් පමණ රැදී සිට, බොට් වැඩ කරන්නේ දැයි බැලීමට `.menu` ලෙස යවන්න.\n" +
                 "⚠️ විනාඩි 5ක් ඇතුළත බොට් සම්බන්ධ නොවූ වුවහොත්, කරුණාකර ඔබේ දුරකථනයේ WhatsApp Linked Devices වෙත ගොස් ඩිවයිස් එක ලොග් අවුට් කර (Unlink කර) නැවත උත්සාහ කරන්න.\n\n" +
                 "----------------------------------------\n\n" +
                 "✅ *வாட்ஸ்அப் போட் வெற்றிகரமாக இணைக்கப்பட்டது!*\n\n" +
-                "⏳ தயவுசெய்து 30 விநாடிகள் காத்திருந்து, போட் வேலை செய்கிறதா என்பதைப் பார்க்க `.menu` என தட்டச்சு செய்யவும்.\n" +
+                "⏳ தயவுசெய்து 60 விநாடிகள் காத்திருந்து, போட் வேலை செய்கிறதா என்பதைப் பார்க்க `.menu` என தட்டச்சு செய்யவும்.\n" +
                 "⚠️ 5 நிமிடங்களுக்குள் போட் இணைக்கப்படவில்லை என்றால், உங்கள் சாதனத்தில் உள்ள WhatsApp Linked Devices-ல் சென்று சாதனத்தை லாக் அவுட் (Log out) செய்துவிட்டு மீண்டும் முயற்சிக்கவும்.";
 
             await sock.sendMessage(jid, { 
