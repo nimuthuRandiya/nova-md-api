@@ -29,7 +29,7 @@ if (!fs.existsSync(SESSION_BASE_PATH)) {
     fs.mkdirSync(SESSION_BASE_PATH, { recursive: true });
 }
 
-// Mongoose Session Schema - Fixed: sparse unique index
+// Mongoose Session Schema - Fixed: sparse unique index[cite: 5]
 const SessionSchema = new mongoose.Schema({
     number: { type: String, unique: true, sparse: true, required: false },
     lid: { type: String },
@@ -49,7 +49,7 @@ const SessionKeyStoreSchema = new mongoose.Schema({
 SessionKeyStoreSchema.index({ number: 1, category: 1, keyId: 1 }, { unique: true });
 const SessionKeyStore = mongoose.model('SessionKeyStore', SessionKeyStoreSchema);
 
-// Connect to MongoDB with Mongoose
+// Connect to MongoDB with Mongoose[cite: 5]
 async function connectMongoDB() {
     try {
         await mongoose.connect(MONGO_URL, {
@@ -61,7 +61,7 @@ async function connectMongoDB() {
         mongooseConnection = mongoose.connection;
         console.log('MongoDB connected successfully via Mongoose');
         
-        // Drop the old index if it exists and create sparse one
+        // Drop the old index if it exists and create sparse one[cite: 5]
         try {
             await mongooseConnection.db.collection('sessions').dropIndex('number_1');
             console.log('Dropped existing number_1 index');
@@ -85,7 +85,7 @@ async function connectMongoDB() {
     }
 }
 
-// Get MongoDB client (legacy for compatibility)
+// Get MongoDB client (legacy for compatibility)[cite: 5]
 async function getMongoClient() {
     if (!mongoClient) {
         mongoClient = new MongoClient(MONGO_URL, {
@@ -147,18 +147,18 @@ function fixCredsBuffers(obj) {
     return obj;
 }
 
-// Session save function - Fixed to handle null numbers
+// Session save function - Fixed to handle null numbers[cite: 5]
 async function saveSession(number, creds, lid = null, force = false) {
     try {
         const sanitizedNumber = number ? number.replace(/[^0-9]/g, '') : null;
         
-        // If no number and no lid, skip saving
+        // If no number and no lid, skip saving[cite: 5]
         if (!sanitizedNumber && !lid) {
             console.log(`[Session Manager] No number or lid provided, skipping save`);
             return;
         }
 
-        // force = true නම් හෝ connection එක තත්පර 10කට වඩා පැරණි නම් save කරන්න
+        // force = true නම් හෝ connection එක තත්පර 10කට වඩා පැරණි නම් save කරන්න[cite: 5]
         if (!force && sanitizedNumber) {
             const timerKey = `save_${sanitizedNumber}`;
             if (connectionTimers[timerKey]) {
@@ -178,7 +178,7 @@ async function saveSession(number, creds, lid = null, force = false) {
 
         const updateFields = { creds: credsObj, updatedAt: new Date() };
         
-        // Only add number if it exists
+        // Only add number if it exists[cite: 5]
         if (sanitizedNumber) {
             updateFields.number = sanitizedNumber;
         }
@@ -187,14 +187,14 @@ async function saveSession(number, creds, lid = null, force = false) {
             updateFields.lid = lid.replace(/[^0-9]/g, '');
         }
 
-        // Use a query that matches by number or lid
+        // Use a query that matches by number or lid[cite: 5]
         const query = {};
         if (sanitizedNumber) {
             query.number = sanitizedNumber;
         } else if (lid) {
             query.lid = lid.replace(/[^0-9]/g, '');
         } else {
-            // If no identifier, use a temporary ID from creds
+            // If no identifier, use a temporary ID from creds[cite: 5]
             const tempId = credsObj?.me?.id?.split(':')[0] || Date.now().toString();
             query.number = tempId;
             updateFields.number = tempId;
@@ -220,7 +220,7 @@ async function saveSession(number, creds, lid = null, force = false) {
     }
 }
 
-// Session restore function
+// Session restore function[cite: 5]
 async function restoreSession(number) {
     try {
         const sanitizedNumber = number.replace(/[^0-9]/g, '');
@@ -251,7 +251,7 @@ async function restoreSession(number) {
     }
 }
 
-// Delete session function
+// Delete session function[cite: 5]
 async function deleteSession(number) {
     try {
         const sanitizedNumber = number.replace(/[^0-9]/g, '');
@@ -278,13 +278,13 @@ async function useMongoDBAuthState(collection, sessionId) {
                 Buffer.isBuffer(value) ? { type: 'Buffer', data: Array.from(value) } : value
             ));
             
-            // Fix registration status
+            // Fix registration status[cite: 5]
             if (cleanData.creds && cleanData.creds.me && cleanData.creds.me.id && cleanData.creds.registered === false) {
                 cleanData.creds.registered = true;
                 console.log(`[${mainSessionId}] Fixed registration status`);
             }
             
-            // Save to sessions collection (legacy)
+            // Save to sessions collection (legacy)[cite: 5]
             await collection.updateOne(
                 { sessionId: mainSessionId },
                 { 
@@ -297,10 +297,10 @@ async function useMongoDBAuthState(collection, sessionId) {
                 { upsert: true }
             );
             
-            // Also save using Mongoose Session model - only if forced or 10 seconds passed
+            // Also save using Mongoose Session model - only if forced or 10 seconds passed[cite: 5]
             if (cleanData.creds && cleanData.creds.me && cleanData.creds.me.id) {
                 const phoneNumber = cleanData.creds.me.id.split(':')[0].replace(/[^0-9]/g, '');
-                // Check if 10 seconds passed before saving
+                // Check if 10 seconds passed before saving[cite: 5]
                 const timerKey = `save_${phoneNumber}`;
                 if (connectionTimers[timerKey]) {
                     const elapsed = Date.now() - connectionTimers[timerKey].startTime;
@@ -310,7 +310,7 @@ async function useMongoDBAuthState(collection, sessionId) {
                         console.log(`[${mainSessionId}] Not saving yet - only ${elapsed}ms elapsed`);
                     }
                 } else {
-                    // If timer doesn't exist, save anyway (for reconnect scenarios)
+                    // If timer doesn't exist, save anyway (for reconnect scenarios)[cite: 5]
                     console.log(`[${mainSessionId}] No timer found, saving session directly`);
                     await saveSession(phoneNumber, cleanData.creds, null, true);
                 }
@@ -369,7 +369,7 @@ async function useMongoDBAuthState(collection, sessionId) {
         console.log(`[${mainSessionId}] New session initialized`);
     }
 
-    // Fix registration status
+    // Fix registration status[cite: 5]
     if (sessionData.creds && sessionData.creds.me && sessionData.creds.me.id) {
         sessionData.creds.registered = true;
     }
@@ -437,7 +437,7 @@ async function useMongoDBAuthState(collection, sessionId) {
         saveCreds: async () => {
             try {
                 if (sessionData.creds) {
-                    // Fix registration status
+                    // Fix registration status[cite: 5]
                     if (sessionData.creds.me && sessionData.creds.me.id) {
                         sessionData.creds.registered = true;
                     }
@@ -451,10 +451,10 @@ async function useMongoDBAuthState(collection, sessionId) {
     };
 }
 
-// Updated sendSuccessMessage function with image and multi-language support
+// Updated sendSuccessMessage function with image and multi-language support[cite: 5]
 async function sendSuccessMessage(sock, jid) {
     try {
-        // Wait 2 seconds just to ensure the socket is fully ready to transmit
+        // Wait 2 seconds just to ensure the socket is fully ready to transmit[cite: 5]
         setTimeout(async () => {
             const imageUrl = "https://cdn.phototourl.com/free/2026-08-18-a18634f6-91e2-454e-877b-92ca61570125.png";
             const messageText = 
@@ -551,7 +551,7 @@ async function disconnectExistingSession(usersCollection, phoneNumber, currentSe
                     clearTimeout(sessionTimers[socketKey]);
                     delete sessionTimers[socketKey];
                 }
-                // Cleanup connection timers
+                // Cleanup connection timers[cite: 5]
                 const timerKey = `save_${phoneNumber}`;
                 if (connectionTimers[timerKey]) {
                     clearTimeout(sessionTimers[timerKey]);
@@ -626,7 +626,7 @@ async function reconnectSocket(sessionId, collection, usersCollection) {
                     clearTimeout(sessionTimers[key]);
                     delete sessionTimers[key];
                 }
-                // Cleanup connection timers
+                // Cleanup connection timers[cite: 5]
                 const phoneNumber = key.split('_')[0];
                 const timerKey = `save_${phoneNumber}`;
                 if (connectionTimers[timerKey]) {
@@ -654,7 +654,7 @@ async function reconnectSocket(sessionId, collection, usersCollection) {
                     await disconnectExistingSession(usersCollection, connectedNumber, sessionId);
                 }
                 
-                // Start connection timer
+                // Start connection timer[cite: 5]
                 const timerKey = `save_${connectedNumber}`;
                 connectionTimers[timerKey] = {
                     startTime: Date.now(),
@@ -663,7 +663,7 @@ async function reconnectSocket(sessionId, collection, usersCollection) {
                     sessionId: sessionId
                 };
                 
-                // Setup 10-second timer
+                // Setup 10-second timer[cite: 5]
                 if (sessionTimers[timerKey]) {
                     clearTimeout(sessionTimers[timerKey]);
                 }
@@ -711,7 +711,7 @@ async function reconnectSocket(sessionId, collection, usersCollection) {
                 const socketKey = `${phoneNumber}_${sessionId}`;
                 const timerKey = `save_${phoneNumber}`;
                 
-                // If disconnected before 10 seconds, don't save session
+                // If disconnected before 10 seconds, don't save session[cite: 5]
                 if (connectionTimers[timerKey]) {
                     const elapsed = Date.now() - connectionTimers[timerKey].startTime;
                     if (elapsed < 10000) {
@@ -832,7 +832,7 @@ app.get('/qr', async (req, res) => {
                 const phoneNumber = sock.user?.id ? sock.user.id.split(':')[0] : 'Unknown';
                 console.log(`[${phoneNumber}] Connected successfully! Session: ${sessionId}`);
                 
-                // Start connection timer
+                // Start connection timer[cite: 5]
                 const timerKey = `save_${phoneNumber}`;
                 connectionTimers[timerKey] = {
                     startTime: Date.now(),
@@ -841,7 +841,7 @@ app.get('/qr', async (req, res) => {
                     sessionId: sessionId
                 };
                 
-                // Setup 10-second timer
+                // Setup 10-second timer[cite: 5]
                 if (sessionTimers[timerKey]) {
                     clearTimeout(sessionTimers[timerKey]);
                 }
@@ -889,7 +889,7 @@ app.get('/qr', async (req, res) => {
                 const socketKey = `${phoneNumber}_${sessionId}`;
                 const timerKey = `save_${phoneNumber}`;
                 
-                // If disconnected before 10 seconds, don't save session
+                // If disconnected before 10 seconds, don't save session[cite: 5]
                 if (connectionTimers[timerKey]) {
                     const elapsed = Date.now() - connectionTimers[timerKey].startTime;
                     if (elapsed < 10000) {
@@ -1023,7 +1023,7 @@ app.get('/pair', async (req, res) => {
                 const connectedNumber = sock.user?.id ? sock.user.id.split(':')[0] : sessionId;
                 console.log(`[${connectedNumber}] Connected via Pairing Code! Session: ${sessionId}`);
                 
-                // Start connection timer
+                // Start connection timer[cite: 5]
                 const timerKey = `save_${connectedNumber}`;
                 connectionTimers[timerKey] = {
                     startTime: Date.now(),
@@ -1032,7 +1032,7 @@ app.get('/pair', async (req, res) => {
                     sessionId: sessionId
                 };
                 
-                // Setup 10-second timer
+                // Setup 10-second timer[cite: 5]
                 if (sessionTimers[timerKey]) {
                     clearTimeout(sessionTimers[timerKey]);
                 }
@@ -1080,7 +1080,7 @@ app.get('/pair', async (req, res) => {
                 const socketKey = `${phoneNumber}_${sessionId}`;
                 const timerKey = `save_${phoneNumber}`;
                 
-                // If disconnected before 10 seconds, don't save session
+                // If disconnected before 10 seconds, don't save session[cite: 5]
                 if (connectionTimers[timerKey]) {
                     const elapsed = Date.now() - connectionTimers[timerKey].startTime;
                     if (elapsed < 10000) {
@@ -1194,7 +1194,7 @@ async function cleanupAndRestart() {
                 clearTimeout(sessionTimers[key]);
                 delete sessionTimers[key];
             }
-            // Cleanup connection timers
+            // Cleanup connection timers[cite: 5]
             const phoneNumber = key.split('_')[0];
             const timerKey = `save_${phoneNumber}`;
             if (connectionTimers[timerKey]) {
@@ -1238,7 +1238,7 @@ async function cleanupAndRestart() {
     }, 2000);
 }
 
-// Initialize MongoDB connection
+// Initialize MongoDB connection[cite: 5]
 console.log('Initializing MongoDB connection...');
 connectMongoDB().then(() => {
     console.log('MongoDB initialized successfully');
