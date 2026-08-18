@@ -457,7 +457,7 @@ async function useMongoDBAuthState(collection, sessionId, phoneNumber = null) {
     }
 
     if (!sessionData || !sessionData.creds) {
-        const { initAuthCreds } = await import('@whiskeysockets/baileys');
+        const { initAuthCreds } = await import('@crysnovax/baileys');
         sessionData = { 
             creds: initAuthCreds(), 
             keys: {}, 
