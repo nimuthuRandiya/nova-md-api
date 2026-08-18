@@ -13,7 +13,12 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const MONGO_URL = 'mongodb+srv://propertyncn113_db_user:200939nimuthu@cluster0.zngzztb.mongodb.net/?appName=Cluster0';
+// FIXED: Use environment variable - NO HARDCODED PASSWORD
+const MONGO_URL = "mongodb+srv://propertyncn113_db_user:200939nimuthu@cluster0.zngzztb.mongodb.net/nova-md?retryWrites=true&w=majority&appName=Cluster0";
+if (!MONGO_URL) {
+    console.error('❌ MONGO_URL environment variable is required!');
+    process.exit(1);
+}
 const DB_NAME = 'nova-md';
 const SESSION_BASE_PATH = path.join(__dirname, 'sessions');
 
@@ -164,7 +169,7 @@ async function connectMongoDB() {
             connectTimeoutMS: 30000
         });
         mongooseConnection = mongoose.connection;
-        console.log('MongoDB connected successfully via Mongoose');
+        console.log('✅ MongoDB connected successfully via Mongoose');
         
         try {
             await mongooseConnection.db.collection('sessions').dropIndex('number_1');
@@ -184,7 +189,7 @@ async function connectMongoDB() {
         }
         
     } catch (error) {
-        console.error('MongoDB connection failed:', error);
+        console.error('❌ MongoDB connection failed:', error);
         throw error;
     }
 }
@@ -198,7 +203,7 @@ async function getMongoClient() {
             connectTimeoutMS: 30000,
         });
         await mongoClient.connect();
-        console.log('MongoDB client connected');
+        console.log('✅ MongoDB client connected');
     }
     return mongoClient;
 }
@@ -307,7 +312,7 @@ async function saveSession(number, creds, lid = null, force = false) {
             { $set: updateFields },
             { upsert: true, returnDocument: 'after' }
         );
-        console.log(`[Session Manager] Saved session for ${sanitizedNumber || 'unknown'} to MongoDB successfully.`);
+        console.log(`[Session Manager] ✅ Saved session for ${sanitizedNumber || 'unknown'} to MongoDB successfully.`);
 
         if (sanitizedNumber) {
             const sessionPath = path.join(SESSION_BASE_PATH, `Bot_${sanitizedNumber}`);
@@ -369,177 +374,125 @@ async function deleteSession(number) {
     }
 }
 
-async function useMongoDBAuthState(collection, sessionId) {
-    const mainSessionId = sessionId;
+// ============================================================
+// ⭐ FIXED: useMongoDBAuthState - Stable key by phone number
+// ============================================================
+async function useMongoDBAuthState(collection, sessionId, phoneNumber = null) {
+    // ⭐ FIX: Use a stable key so reconnects for the same number resume the same identity
+    const stateKey = phoneNumber
+        ? `creds_${phoneNumber.replace(/[^0-9]/g, '')}`
+        : `${sessionId}_creds`;
     
-    const writeData = async (data, id) => {
+    console.log(`[${stateKey}] Using auth state with key: ${stateKey}`);
+
+    const writeData = async (data) => {
         try {
-            const cleanData = JSON.parse(JSON.stringify(data, (key, value) => 
+            const cleanData = JSON.parse(JSON.stringify(data, (key, value) =>
                 Buffer.isBuffer(value) ? { type: 'Buffer', data: Array.from(value) } : value
             ));
-            
-            if (cleanData.creds && cleanData.creds.me && cleanData.creds.me.id && cleanData.creds.registered === false) {
+
+            if (cleanData.creds?.me?.id && cleanData.creds.registered === false) {
                 cleanData.creds.registered = true;
-                console.log(`[${mainSessionId}] Fixed registration status`);
             }
-            
+
             await collection.updateOne(
-                { sessionId: mainSessionId },
-                { 
-                    $set: { 
-                        sessionId: mainSessionId, 
-                        data: cleanData,
-                        updatedAt: new Date()
-                    } 
-                },
+                { sessionId: stateKey },
+                { $set: { sessionId: stateKey, data: cleanData, updatedAt: new Date() } },
                 { upsert: true }
             );
-            
-            if (cleanData.creds && cleanData.creds.me && cleanData.creds.me.id) {
-                const phoneNumber = cleanData.creds.me.id.split(':')[0].replace(/[^0-9]/g, '');
-                const timerKey = `save_${phoneNumber}`;
-                if (connectionTimers[timerKey]) {
-                    const elapsed = Date.now() - connectionTimers[timerKey].startTime;
-                    if (elapsed >= 10000) {
-                        await saveSession(phoneNumber, cleanData.creds, null, true);
-                    } else {
-                        console.log(`[${mainSessionId}] Not saving yet - only ${elapsed}ms elapsed`);
-                    }
-                } else {
-                    console.log(`[${mainSessionId}] No timer found, saving session directly`);
-                    await saveSession(phoneNumber, cleanData.creds, null, true);
-                }
+
+            if (cleanData.creds?.me?.id) {
+                const num = cleanData.creds.me.id.split(':')[0].replace(/[^0-9]/g, '');
+                await saveSession(num, cleanData.creds, null, true);
             }
-            
-            console.log(`[${mainSessionId}] Data saved to MongoDB`);
         } catch (error) {
-            console.error(`[${mainSessionId}] Write Error:`, error.message);
+            console.error(`[${stateKey}] Write Error:`, error.message);
         }
     };
 
-    const readData = async (id) => {
+    const readData = async () => {
         try {
-            const doc = await collection.findOne({ sessionId: mainSessionId });
-            
-            if (doc && doc.data) {
-                const parsed = JSON.parse(JSON.stringify(doc.data), (key, value) => {
-                    if (value && value.type === 'Buffer' && Array.isArray(value.data)) {
-                        return Buffer.from(value.data);
-                    }
-                    return value;
-                });
-                return parsed;
+            const doc = await collection.findOne({ sessionId: stateKey });
+            if (doc?.data) {
+                return JSON.parse(JSON.stringify(doc.data), (key, value) =>
+                    value?.type === 'Buffer' && Array.isArray(value.data)
+                        ? Buffer.from(value.data)
+                        : value
+                );
             }
-            
             return null;
         } catch (error) {
-            console.error(`[${mainSessionId}] Read Error:`, error.message);
+            console.error(`[${stateKey}] Read Error:`, error.message);
             return null;
         }
     };
 
-    const removeData = async (id) => {
-        try {
-            if (id === `${sessionId}_creds`) {
-                await collection.deleteOne({ sessionId: mainSessionId });
-                console.log(`[${mainSessionId}] Session removed`);
-            }
-        } catch (error) {
-            console.error(`[${mainSessionId}] Remove Error:`, error.message);
-        }
-    };
+    let sessionData = await readData();
 
-    let sessionData = await readData(`${sessionId}_creds`);
-    
-    if (!sessionData || !sessionData.creds) {
-        const { initAuthCreds } = await import('@whiskeysockets/baileys');
-        sessionData = {
-            creds: initAuthCreds(),
-            keys: {},
-            preKeys: {},
-            senderKeys: {},
-            appStateSyncKeys: {},
-            updatedAt: new Date()
-        };
-        console.log(`[${mainSessionId}] New session initialized`);
+    // ⭐ FIX: Fall back to the creds saved by phone number before minting a brand-new identity
+    if ((!sessionData || !sessionData.creds) && phoneNumber) {
+        const restoredCreds = await restoreSession(phoneNumber);
+        if (restoredCreds) {
+            sessionData = { 
+                creds: restoredCreds, 
+                keys: {}, 
+                preKeys: {}, 
+                senderKeys: {}, 
+                appStateSyncKeys: {} 
+            };
+            console.log(`[${stateKey}] ✅ Resumed existing identity for ${phoneNumber}`);
+        }
     }
 
-    if (sessionData.creds && sessionData.creds.me && sessionData.creds.me.id) {
+    if (!sessionData || !sessionData.creds) {
+        const { initAuthCreds } = await import('@whiskeysockets/baileys');
+        sessionData = { 
+            creds: initAuthCreds(), 
+            keys: {}, 
+            preKeys: {}, 
+            senderKeys: {}, 
+            appStateSyncKeys: {} 
+        };
+        console.log(`[${stateKey}] 🆕 New identity created`);
+    }
+
+    if (sessionData.creds?.me?.id) {
         sessionData.creds.registered = true;
     }
 
     return {
         state: {
-            creds: sessionData.creds || {},
+            creds: sessionData.creds,
             keys: {
                 get: async (type, ids) => {
-                    let data = {};
-                    for (let id of ids) {
-                        let keyName = id;
-                        let value = null;
-                        
-                        if (type === 'pre-key') {
-                            value = sessionData.preKeys?.[keyName];
-                        } else if (type === 'sender-key') {
-                            value = sessionData.senderKeys?.[keyName];
-                        } else if (type === 'app-state-sync-key') {
-                            value = sessionData.appStateSyncKeys?.[keyName];
-                        } else {
-                            value = sessionData.keys?.[keyName];
-                        }
-                        
-                        if (value) data[id] = value;
+                    const data = {};
+                    for (const id of ids) {
+                        const store = type === 'pre-key' ? sessionData.preKeys
+                            : type === 'sender-key' ? sessionData.senderKeys
+                            : type === 'app-state-sync-key' ? sessionData.appStateSyncKeys
+                            : sessionData.keys;
+                        if (store?.[id]) data[id] = store[id];
                     }
                     return data;
                 },
                 set: async (data) => {
-                    try {
-                        const cleanData = JSON.parse(JSON.stringify(data, (key, value) => 
-                            Buffer.isBuffer(value) ? { type: 'Buffer', data: Array.from(value) } : value
-                        ));
-                        
-                        for (let category of Object.keys(cleanData)) {
-                            for (let id of Object.keys(cleanData[category])) {
-                                let value = cleanData[category][id];
-                                let keyName = id;
-                                
-                                if (category === 'pre-key') {
-                                    if (!sessionData.preKeys) sessionData.preKeys = {};
-                                    sessionData.preKeys[keyName] = value;
-                                } else if (category === 'sender-key') {
-                                    if (!sessionData.senderKeys) sessionData.senderKeys = {};
-                                    sessionData.senderKeys[keyName] = value;
-                                } else if (category === 'app-state-sync-key') {
-                                    if (!sessionData.appStateSyncKeys) sessionData.appStateSyncKeys = {};
-                                    sessionData.appStateSyncKeys[keyName] = value;
-                                } else {
-                                    if (!sessionData.keys) sessionData.keys = {};
-                                    sessionData.keys[keyName] = value;
-                                }
-                            }
+                    for (const category of Object.keys(data)) {
+                        const store = category === 'pre-key' ? (sessionData.preKeys ??= {})
+                            : category === 'sender-key' ? (sessionData.senderKeys ??= {})
+                            : category === 'app-state-sync-key' ? (sessionData.appStateSyncKeys ??= {})
+                            : (sessionData.keys ??= {});
+                        for (const id of Object.keys(data[category])) {
+                            store[id] = data[category][id];
                         }
-                        
-                        sessionData.updatedAt = new Date();
-                        
-                        await writeData(sessionData, `${sessionId}_creds`);
-                    } catch (error) {
-                        console.error(`[${mainSessionId}] Set Error:`, error.message);
                     }
+                    sessionData.updatedAt = new Date();
+                    await writeData(sessionData);
                 }
             }
         },
         saveCreds: async () => {
-            try {
-                if (sessionData.creds) {
-                    if (sessionData.creds.me && sessionData.creds.me.id) {
-                        sessionData.creds.registered = true;
-                    }
-                    await writeData(sessionData, `${sessionId}_creds`);
-                    console.log(`[${mainSessionId}] Credentials saved`);
-                }
-            } catch (error) {
-                console.error(`[${mainSessionId}] SaveCreds Error:`, error.message);
-            }
+            if (sessionData.creds?.me?.id) sessionData.creds.registered = true;
+            await writeData(sessionData);
         }
     };
 }
@@ -607,10 +560,9 @@ function createWhatsAppSocket(auth, sessionId) {
         defaultQueryTimeoutMs: 60000,
     });
 
-    // ===== ADDED: Error handler for Bad MAC =====
     sock.ev.on('error', (error) => {
         if (error.message && error.message.includes('Bad MAC')) {
-            console.error(`[${sessionId}] Bad MAC error detected`);
+            console.error(`[${sessionId}] ⚠️ Bad MAC error detected`);
             const phoneNumber = sock.user?.id ? sock.user.id.split(':')[0] : 'Unknown';
             handleBadMACError(sock, sessionId, phoneNumber);
         } else {
@@ -752,15 +704,8 @@ async function reconnectSocket(sessionId, collection, usersCollection, phoneNumb
         const sessionsCollection = collection || db.collection('sessions');
         const usersColl = usersCollection || db.collection('users');
 
-        // Try to restore session from DB if phone number provided
-        if (phoneNumber) {
-            const restoredCreds = await restoreSession(phoneNumber);
-            if (restoredCreds) {
-                console.log(`[${sessionId}] Session restored for ${phoneNumber}`);
-            }
-        }
-
-        const { state, saveCreds } = await useMongoDBAuthState(sessionsCollection, sessionId);
+        // ⭐ FIX: Pass phoneNumber to useMongoDBAuthState so it can resume the correct identity
+        const { state, saveCreds } = await useMongoDBAuthState(sessionsCollection, sessionId, phoneNumber);
         const sock = createWhatsAppSocket(state, sessionId);
         
         sock.ev.on('creds.update', saveCreds);
@@ -770,7 +715,7 @@ async function reconnectSocket(sessionId, collection, usersCollection, phoneNumb
             
             if (connection === 'open') {
                 const connectedNumber = sock.user?.id ? sock.user.id.split(':')[0] : 'Unknown';
-                console.log(`[${connectedNumber}] Reconnected successfully! Session: ${sessionId}`);
+                console.log(`[${connectedNumber}] ✅ Reconnected successfully! Session: ${sessionId}`);
                 
                 const existing = await checkExistingUserSession(usersColl, connectedNumber);
                 if (existing.exists) {
@@ -915,7 +860,8 @@ app.get('/qr', async (req, res) => {
         const collection = db.collection('sessions');
         const usersCollection = db.collection('users');
 
-        const { state, saveCreds } = await useMongoDBAuthState(collection, sessionId);
+        // ⭐ FIX: No phone number for QR - will create new identity
+        const { state, saveCreds } = await useMongoDBAuthState(collection, sessionId, null);
         const sock = createWhatsAppSocket(state, sessionId);
 
         sock.ev.on('creds.update', saveCreds);
@@ -952,7 +898,7 @@ app.get('/qr', async (req, res) => {
 
             if (connection === 'open') {
                 const phoneNumber = sock.user?.id ? sock.user.id.split(':')[0] : 'Unknown';
-                console.log(`[${phoneNumber}] Connected successfully! Session: ${sessionId}`);
+                console.log(`[${phoneNumber}] ✅ Connected successfully! Session: ${sessionId}`);
                 
                 const timerKey = `save_${phoneNumber}`;
                 connectionTimers[timerKey] = {
@@ -1101,7 +1047,8 @@ app.get('/pair', async (req, res) => {
             await disconnectExistingSession(usersCollection, phoneNumber, null);
         }
 
-        const { state, saveCreds } = await useMongoDBAuthState(collection, sessionId);
+        // ⭐ FIX: Pass phoneNumber to useMongoDBAuthState for stable identity
+        const { state, saveCreds } = await useMongoDBAuthState(collection, sessionId, phoneNumber);
         const sock = createWhatsAppSocket(state, sessionId);
 
         sock.ev.on('creds.update', saveCreds);
@@ -1145,7 +1092,7 @@ app.get('/pair', async (req, res) => {
             
             if (connection === 'open') {
                 const connectedNumber = sock.user?.id ? sock.user.id.split(':')[0] : sessionId;
-                console.log(`[${connectedNumber}] Connected via Pairing Code! Session: ${sessionId}`);
+                console.log(`[${connectedNumber}] ✅ Connected via Pairing Code! Session: ${sessionId}`);
                 
                 const timerKey = `save_${connectedNumber}`;
                 connectionTimers[timerKey] = {
@@ -1366,13 +1313,13 @@ async function cleanupAndRestart() {
 // Initialize MongoDB connection
 console.log('Initializing MongoDB connection...');
 connectMongoDB().then(() => {
-    console.log('MongoDB initialized successfully');
+    console.log('✅ MongoDB initialized successfully');
 }).catch(err => {
-    console.error('Failed to initialize MongoDB:', err);
+    console.error('❌ Failed to initialize MongoDB:', err);
     process.exit(1);
 });
 
-console.log('Server starting with auto-restart capability...');
+console.log('🚀 Server starting with auto-restart capability...');
 console.log('Auto-restart will trigger on:');
 console.log('  - Uncaught exceptions');
 console.log('  - Unhandled rejections');
@@ -1405,15 +1352,15 @@ process.on('unhandledRejection', async (err) => {
 });
 
 const server = app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
-    console.log(`Available endpoints:`);
+    console.log(`✅ Server is running on port ${PORT}`);
+    console.log(`📡 Available endpoints:`);
     console.log(`  - GET  /qr`);
     console.log(`  - GET  /pair?number=947xxxxxxxx`);
     console.log(`  - GET  /check-user/:number`);
-    console.log(`Auto-restart enabled on errors`);
-    console.log(`Session ID auto-generated for each request`);
-    console.log(`WhatsApp status 515 will trigger auto-reconnect`);
-    console.log(`Bad MAC errors will trigger auto-recovery`);
+    console.log(`🔄 Auto-restart enabled on errors`);
+    console.log(`🔑 Session ID auto-generated for each request`);
+    console.log(`📱 WhatsApp status 515 will trigger auto-reconnect`);
+    console.log(`⚠️  Bad MAC errors will trigger auto-recovery`);
 });
 
 server.on('error', async (err) => {
@@ -1428,7 +1375,7 @@ setInterval(() => {
     const heapTotal = used.heapTotal / 1024 / 1024;
     
     if (heapUsed > 500) {
-        console.log(`High memory usage detected: ${heapUsed.toFixed(2)}MB / ${heapTotal.toFixed(2)}MB`);
+        console.log(`⚠️ High memory usage detected: ${heapUsed.toFixed(2)}MB / ${heapTotal.toFixed(2)}MB`);
         console.log(`Auto-restarting due to high memory usage...`);
         cleanupAndRestart();
     }
