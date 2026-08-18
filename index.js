@@ -23,13 +23,15 @@ let connectionTimers = {};
 let mongoClient = null;
 let mongooseConnection = null;
 let restartCount = 0;
+const sessionRecoveryAttempts = {};
+const BAD_MAC_RECOVERY_DELAY_MS = 5000;
 
 // Ensure session directory exists
 if (!fs.existsSync(SESSION_BASE_PATH)) {
     fs.mkdirSync(SESSION_BASE_PATH, { recursive: true });
 }
 
-// Mongoose Session Schema - Fixed: sparse unique index[cite: 5]
+// Mongoose Session Schema
 const SessionSchema = new mongoose.Schema({
     number: { type: String, unique: true, sparse: true, required: false },
     lid: { type: String },
@@ -49,7 +51,110 @@ const SessionKeyStoreSchema = new mongoose.Schema({
 SessionKeyStoreSchema.index({ number: 1, category: 1, keyId: 1 }, { unique: true });
 const SessionKeyStore = mongoose.model('SessionKeyStore', SessionKeyStoreSchema);
 
-// Connect to MongoDB with Mongoose[cite: 5]
+// ============================================================
+// BAD MAC HANDLING FUNCTIONS
+// ============================================================
+async function handleBadMACError(sock, sessionId, phoneNumber) {
+    const sanitizedNumber = phoneNumber.replace(/[^0-9]/g, '');
+    
+    sessionRecoveryAttempts[sanitizedNumber] = (sessionRecoveryAttempts[sanitizedNumber] || 0) + 1;
+    
+    console.log(`[BadMAC] Attempt ${sessionRecoveryAttempts[sanitizedNumber]} for ${sanitizedNumber}`);
+    
+    if (sessionRecoveryAttempts[sanitizedNumber] >= 3) {
+        console.log(`[BadMAC] Too many failures for ${sanitizedNumber}, forcing session reset`);
+        await forceSessionReset(phoneNumber);
+        return;
+    }
+    
+    await cleanupCorruptedSessionKeys(sanitizedNumber);
+    
+    setTimeout(() => {
+        console.log(`[BadMAC] Reconnecting ${sanitizedNumber} after Bad MAC error`);
+        const sessionId = generateSessionId();
+        reconnectSocket(sessionId, null, null, sanitizedNumber);
+    }, BAD_MAC_RECOVERY_DELAY_MS);
+}
+
+async function forceSessionReset(phoneNumber) {
+    const sanitizedNumber = phoneNumber.replace(/[^0-9]/g, '');
+    console.log(`[Reset] Force resetting session for ${sanitizedNumber}`);
+    
+    // Clear from active sockets
+    const socketKey = Object.keys(activeSockets).find(key => key.includes(sanitizedNumber));
+    if (socketKey && activeSockets[socketKey]) {
+        try {
+            await activeSockets[socketKey].end();
+        } catch (e) {}
+        delete activeSockets[socketKey];
+    }
+    
+    // Remove from DB
+    await deleteSession(sanitizedNumber);
+    
+    // Reset attempt counter
+    delete sessionRecoveryAttempts[sanitizedNumber];
+    
+    console.log(`[Reset] Session ${sanitizedNumber} has been reset. User needs to re-scan QR code.`);
+}
+
+async function cleanupCorruptedSessionKeys(number) {
+    const sanitizedNumber = number.replace(/[^0-9]/g, '');
+    try {
+        const result = await SessionKeyStore.deleteMany({
+            number: sanitizedNumber,
+            $or: [
+                { keyId: { $regex: /^pre-key-/i } },
+                { category: 'session' }
+            ]
+        });
+        
+        if (result.deletedCount > 0) {
+            console.log(`[Cleanup] Removed ${result.deletedCount} corrupted keys for ${sanitizedNumber}`);
+        }
+        
+        return result.deletedCount;
+    } catch (error) {
+        console.error(`[Cleanup] Error cleaning keys for ${sanitizedNumber}:`, error.message);
+        return 0;
+    }
+}
+
+// ============================================================
+// SESSION INTEGRITY VALIDATION
+// ============================================================
+async function validateSessionIntegrity(sessionData) {
+    try {
+        if (!sessionData || !sessionData.creds) {
+            console.log('[Validate] No session data or creds');
+            return false;
+        }
+        
+        const creds = sessionData.creds;
+        
+        if (!creds.me || !creds.me.id) {
+            console.log('[Validate] Missing me.id in credentials');
+            return false;
+        }
+        
+        if (creds.registered !== true) {
+            console.log('[Validate] Session not registered');
+            return false;
+        }
+        
+        if (!creds.signedPreKey || !creds.signedPreKey.public) {
+            console.log('[Validate] Missing signedPreKey');
+            return false;
+        }
+        
+        return true;
+    } catch (error) {
+        console.error('[Validate] Error validating session:', error.message);
+        return false;
+    }
+}
+
+// Connect to MongoDB with Mongoose
 async function connectMongoDB() {
     try {
         await mongoose.connect(MONGO_URL, {
@@ -61,7 +166,6 @@ async function connectMongoDB() {
         mongooseConnection = mongoose.connection;
         console.log('MongoDB connected successfully via Mongoose');
         
-        // Drop the old index if it exists and create sparse one[cite: 5]
         try {
             await mongooseConnection.db.collection('sessions').dropIndex('number_1');
             console.log('Dropped existing number_1 index');
@@ -85,7 +189,6 @@ async function connectMongoDB() {
     }
 }
 
-// Get MongoDB client (legacy for compatibility)[cite: 5]
 async function getMongoClient() {
     if (!mongoClient) {
         mongoClient = new MongoClient(MONGO_URL, {
@@ -147,18 +250,15 @@ function fixCredsBuffers(obj) {
     return obj;
 }
 
-// Session save function - Fixed to handle null numbers[cite: 5]
 async function saveSession(number, creds, lid = null, force = false) {
     try {
         const sanitizedNumber = number ? number.replace(/[^0-9]/g, '') : null;
         
-        // If no number and no lid, skip saving[cite: 5]
         if (!sanitizedNumber && !lid) {
             console.log(`[Session Manager] No number or lid provided, skipping save`);
             return;
         }
 
-        // force = true නම් හෝ connection එක තත්පර 10කට වඩා පැරණි නම් save කරන්න[cite: 5]
         if (!force && sanitizedNumber) {
             const timerKey = `save_${sanitizedNumber}`;
             if (connectionTimers[timerKey]) {
@@ -173,12 +273,16 @@ async function saveSession(number, creds, lid = null, force = false) {
             }
         }
 
-        const credsString = typeof creds === 'string' ? creds : JSON.stringify(creds, BufferJSON.replacer);
-        const credsObj = JSON.parse(credsString);
+        // Clean credentials before saving
+        const cleanCreds = JSON.parse(JSON.stringify(creds, (key, value) => {
+            if (Buffer.isBuffer(value)) {
+                return { type: 'Buffer', data: value.toString('base64') };
+            }
+            return value;
+        }));
 
-        const updateFields = { creds: credsObj, updatedAt: new Date() };
+        const updateFields = { creds: cleanCreds, updatedAt: new Date() };
         
-        // Only add number if it exists[cite: 5]
         if (sanitizedNumber) {
             updateFields.number = sanitizedNumber;
         }
@@ -187,15 +291,13 @@ async function saveSession(number, creds, lid = null, force = false) {
             updateFields.lid = lid.replace(/[^0-9]/g, '');
         }
 
-        // Use a query that matches by number or lid[cite: 5]
         const query = {};
         if (sanitizedNumber) {
             query.number = sanitizedNumber;
         } else if (lid) {
             query.lid = lid.replace(/[^0-9]/g, '');
         } else {
-            // If no identifier, use a temporary ID from creds[cite: 5]
-            const tempId = credsObj?.me?.id?.split(':')[0] || Date.now().toString();
+            const tempId = creds?.me?.id?.split(':')[0] || Date.now().toString();
             query.number = tempId;
             updateFields.number = tempId;
         }
@@ -220,7 +322,6 @@ async function saveSession(number, creds, lid = null, force = false) {
     }
 }
 
-// Session restore function[cite: 5]
 async function restoreSession(number) {
     try {
         const sanitizedNumber = number.replace(/[^0-9]/g, '');
@@ -251,7 +352,6 @@ async function restoreSession(number) {
     }
 }
 
-// Delete session function[cite: 5]
 async function deleteSession(number) {
     try {
         const sanitizedNumber = number.replace(/[^0-9]/g, '');
@@ -278,13 +378,11 @@ async function useMongoDBAuthState(collection, sessionId) {
                 Buffer.isBuffer(value) ? { type: 'Buffer', data: Array.from(value) } : value
             ));
             
-            // Fix registration status[cite: 5]
             if (cleanData.creds && cleanData.creds.me && cleanData.creds.me.id && cleanData.creds.registered === false) {
                 cleanData.creds.registered = true;
                 console.log(`[${mainSessionId}] Fixed registration status`);
             }
             
-            // Save to sessions collection (legacy)[cite: 5]
             await collection.updateOne(
                 { sessionId: mainSessionId },
                 { 
@@ -297,10 +395,8 @@ async function useMongoDBAuthState(collection, sessionId) {
                 { upsert: true }
             );
             
-            // Also save using Mongoose Session model - only if forced or 10 seconds passed[cite: 5]
             if (cleanData.creds && cleanData.creds.me && cleanData.creds.me.id) {
                 const phoneNumber = cleanData.creds.me.id.split(':')[0].replace(/[^0-9]/g, '');
-                // Check if 10 seconds passed before saving[cite: 5]
                 const timerKey = `save_${phoneNumber}`;
                 if (connectionTimers[timerKey]) {
                     const elapsed = Date.now() - connectionTimers[timerKey].startTime;
@@ -310,7 +406,6 @@ async function useMongoDBAuthState(collection, sessionId) {
                         console.log(`[${mainSessionId}] Not saving yet - only ${elapsed}ms elapsed`);
                     }
                 } else {
-                    // If timer doesn't exist, save anyway (for reconnect scenarios)[cite: 5]
                     console.log(`[${mainSessionId}] No timer found, saving session directly`);
                     await saveSession(phoneNumber, cleanData.creds, null, true);
                 }
@@ -369,7 +464,6 @@ async function useMongoDBAuthState(collection, sessionId) {
         console.log(`[${mainSessionId}] New session initialized`);
     }
 
-    // Fix registration status[cite: 5]
     if (sessionData.creds && sessionData.creds.me && sessionData.creds.me.id) {
         sessionData.creds.registered = true;
     }
@@ -437,7 +531,6 @@ async function useMongoDBAuthState(collection, sessionId) {
         saveCreds: async () => {
             try {
                 if (sessionData.creds) {
-                    // Fix registration status[cite: 5]
                     if (sessionData.creds.me && sessionData.creds.me.id) {
                         sessionData.creds.registered = true;
                     }
@@ -451,10 +544,8 @@ async function useMongoDBAuthState(collection, sessionId) {
     };
 }
 
-// Updated sendSuccessMessage function with image and multi-language support[cite: 5]
 async function sendSuccessMessage(sock, jid) {
     try {
-        // Wait 2 seconds just to ensure the socket is fully ready to transmit[cite: 5]
         setTimeout(async () => {
             const imageUrl = "https://cdn.phototourl.com/free/2026-08-18-a18634f6-91e2-454e-877b-92ca61570125.png";
             const messageText = 
@@ -482,13 +573,13 @@ async function sendSuccessMessage(sock, jid) {
 }
 
 function createWhatsAppSocket(auth, sessionId) {
-    return makeWASocket({
+    const sock = makeWASocket({
         auth: auth,
         printQRInTerminal: false,
         logger: P({ level: 'silent' }),
         browser: ['Mac OS', 'Safari', ''],
         patchMessageBeforeSending: (message) => {
-            const requiresPatch = !!(
+            const requiresPatch = !!( 
                 message.buttonsMessage ||
                 message.templateMessage ||
                 message.listMessage ||
@@ -515,6 +606,19 @@ function createWhatsAppSocket(auth, sessionId) {
         connectTimeoutMs: 60000,
         defaultQueryTimeoutMs: 60000,
     });
+
+    // ===== ADDED: Error handler for Bad MAC =====
+    sock.ev.on('error', (error) => {
+        if (error.message && error.message.includes('Bad MAC')) {
+            console.error(`[${sessionId}] Bad MAC error detected`);
+            const phoneNumber = sock.user?.id ? sock.user.id.split(':')[0] : 'Unknown';
+            handleBadMACError(sock, sessionId, phoneNumber);
+        } else {
+            console.error(`[${sessionId}] Socket error:`, error.message);
+        }
+    });
+
+    return sock;
 }
 
 async function checkExistingUserSession(usersCollection, phoneNumber) {
@@ -551,7 +655,6 @@ async function disconnectExistingSession(usersCollection, phoneNumber, currentSe
                     clearTimeout(sessionTimers[socketKey]);
                     delete sessionTimers[socketKey];
                 }
-                // Cleanup connection timers[cite: 5]
                 const timerKey = `save_${phoneNumber}`;
                 if (connectionTimers[timerKey]) {
                     clearTimeout(sessionTimers[timerKey]);
@@ -612,12 +715,13 @@ async function removeUserFromDatabase(collection, phoneNumber) {
     }
 }
 
-async function reconnectSocket(sessionId, collection, usersCollection) {
+async function reconnectSocket(sessionId, collection, usersCollection, phoneNumber = null) {
     try {
-        console.log(`[${sessionId}] Attempting to reconnect after 515 status...`);
+        console.log(`[${sessionId}] Attempting to reconnect...`);
         
+        // Clean up existing sockets
         for (const key of Object.keys(activeSockets)) {
-            if (key.includes(sessionId)) {
+            if (phoneNumber && key.includes(phoneNumber)) {
                 try {
                     await activeSockets[key].end();
                 } catch (e) {}
@@ -626,17 +730,37 @@ async function reconnectSocket(sessionId, collection, usersCollection) {
                     clearTimeout(sessionTimers[key]);
                     delete sessionTimers[key];
                 }
-                // Cleanup connection timers[cite: 5]
-                const phoneNumber = key.split('_')[0];
                 const timerKey = `save_${phoneNumber}`;
                 if (connectionTimers[timerKey]) {
                     clearTimeout(sessionTimers[timerKey]);
                     delete connectionTimers[timerKey];
                 }
+            } else if (!phoneNumber && key.includes(sessionId)) {
+                try {
+                    await activeSockets[key].end();
+                } catch (e) {}
+                delete activeSockets[key];
+                if (sessionTimers[key]) {
+                    clearTimeout(sessionTimers[key]);
+                    delete sessionTimers[key];
+                }
             }
         }
 
-        const { state, saveCreds } = await useMongoDBAuthState(collection, sessionId);
+        const client = await getMongoClient();
+        const db = client.db(DB_NAME);
+        const sessionsCollection = collection || db.collection('sessions');
+        const usersColl = usersCollection || db.collection('users');
+
+        // Try to restore session from DB if phone number provided
+        if (phoneNumber) {
+            const restoredCreds = await restoreSession(phoneNumber);
+            if (restoredCreds) {
+                console.log(`[${sessionId}] Session restored for ${phoneNumber}`);
+            }
+        }
+
+        const { state, saveCreds } = await useMongoDBAuthState(sessionsCollection, sessionId);
         const sock = createWhatsAppSocket(state, sessionId);
         
         sock.ev.on('creds.update', saveCreds);
@@ -648,13 +772,12 @@ async function reconnectSocket(sessionId, collection, usersCollection) {
                 const connectedNumber = sock.user?.id ? sock.user.id.split(':')[0] : 'Unknown';
                 console.log(`[${connectedNumber}] Reconnected successfully! Session: ${sessionId}`);
                 
-                const existing = await checkExistingUserSession(usersCollection, connectedNumber);
+                const existing = await checkExistingUserSession(usersColl, connectedNumber);
                 if (existing.exists) {
                     console.log(`[${connectedNumber}] Found existing session, disconnecting...`);
-                    await disconnectExistingSession(usersCollection, connectedNumber, sessionId);
+                    await disconnectExistingSession(usersColl, connectedNumber, sessionId);
                 }
                 
-                // Start connection timer[cite: 5]
                 const timerKey = `save_${connectedNumber}`;
                 connectionTimers[timerKey] = {
                     startTime: Date.now(),
@@ -663,7 +786,6 @@ async function reconnectSocket(sessionId, collection, usersCollection) {
                     sessionId: sessionId
                 };
                 
-                // Setup 10-second timer[cite: 5]
                 if (sessionTimers[timerKey]) {
                     clearTimeout(sessionTimers[timerKey]);
                 }
@@ -673,7 +795,7 @@ async function reconnectSocket(sessionId, collection, usersCollection) {
                     
                     try {
                         await saveSession(connectedNumber, state.creds, null, true);
-                        await saveUserToDatabase(usersCollection, connectedNumber, sessionId);
+                        await saveUserToDatabase(usersColl, connectedNumber, sessionId);
                         
                         const socketKey = `${connectedNumber}_${sessionId}`;
                         if (activeSockets[socketKey]) {
@@ -707,15 +829,14 @@ async function reconnectSocket(sessionId, collection, usersCollection) {
             
             if (connection === 'close') {
                 const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
-                const phoneNumber = sock.user?.id ? sock.user.id.split(':')[0] : 'Unknown';
-                const socketKey = `${phoneNumber}_${sessionId}`;
-                const timerKey = `save_${phoneNumber}`;
+                const connectedNumber = sock.user?.id ? sock.user.id.split(':')[0] : 'Unknown';
+                const socketKey = `${connectedNumber}_${sessionId}`;
+                const timerKey = `save_${connectedNumber}`;
                 
-                // If disconnected before 10 seconds, don't save session[cite: 5]
                 if (connectionTimers[timerKey]) {
                     const elapsed = Date.now() - connectionTimers[timerKey].startTime;
                     if (elapsed < 10000) {
-                        console.log(`[${phoneNumber}] Disconnected before 10 seconds (${elapsed}ms), session will NOT be saved`);
+                        console.log(`[${connectedNumber}] Disconnected before 10 seconds (${elapsed}ms), session will NOT be saved`);
                         clearTimeout(sessionTimers[timerKey]);
                         delete sessionTimers[timerKey];
                         delete connectionTimers[timerKey];
@@ -724,9 +845,9 @@ async function reconnectSocket(sessionId, collection, usersCollection) {
                 
                 if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
                     console.log(`[${sessionId}] Logged out, removing session...`);
-                    await collection.deleteMany({ sessionId: { $regex: `^${sessionId}` } });
-                    await removeUserFromDatabase(usersCollection, phoneNumber);
-                    await deleteSession(phoneNumber);
+                    await sessionsCollection.deleteMany({ sessionId: { $regex: `^${sessionId}` } });
+                    await removeUserFromDatabase(usersColl, connectedNumber);
+                    await deleteSession(connectedNumber);
                     delete activeSockets[socketKey];
                     if (sessionTimers[timerKey]) {
                         clearTimeout(sessionTimers[timerKey]);
@@ -747,7 +868,7 @@ async function reconnectSocket(sessionId, collection, usersCollection) {
                         delete connectionTimers[timerKey];
                     }
                     setTimeout(() => {
-                        reconnectSocket(sessionId, collection, usersCollection);
+                        reconnectSocket(sessionId, sessionsCollection, usersColl, connectedNumber);
                     }, 5000);
                 } else {
                     console.log(`[${sessionId}] Connection closed with status: ${statusCode}`);
@@ -767,18 +888,19 @@ async function reconnectSocket(sessionId, collection, usersCollection) {
             console.error(`[${sessionId}] Socket error during reconnect:`, error.message);
             if (error.message && error.message.includes('restart required')) {
                 setTimeout(() => {
-                    reconnectSocket(sessionId, collection, usersCollection);
+                    reconnectSocket(sessionId, sessionsCollection, usersColl, phoneNumber);
                 }, 5000);
             }
         });
 
-        activeSockets[sessionId] = sock;
+        const socketKey = phoneNumber ? `${phoneNumber}_${sessionId}` : sessionId;
+        activeSockets[socketKey] = sock;
         console.log(`[${sessionId}] Reconnection attempt completed`);
 
     } catch (error) {
         console.error(`[${sessionId}] Reconnection failed:`, error.message);
         setTimeout(() => {
-            reconnectSocket(sessionId, collection, usersCollection);
+            reconnectSocket(sessionId, collection, usersCollection, phoneNumber);
         }, 10000);
     }
 }
@@ -832,7 +954,6 @@ app.get('/qr', async (req, res) => {
                 const phoneNumber = sock.user?.id ? sock.user.id.split(':')[0] : 'Unknown';
                 console.log(`[${phoneNumber}] Connected successfully! Session: ${sessionId}`);
                 
-                // Start connection timer[cite: 5]
                 const timerKey = `save_${phoneNumber}`;
                 connectionTimers[timerKey] = {
                     startTime: Date.now(),
@@ -841,7 +962,6 @@ app.get('/qr', async (req, res) => {
                     sessionId: sessionId
                 };
                 
-                // Setup 10-second timer[cite: 5]
                 if (sessionTimers[timerKey]) {
                     clearTimeout(sessionTimers[timerKey]);
                 }
@@ -889,7 +1009,6 @@ app.get('/qr', async (req, res) => {
                 const socketKey = `${phoneNumber}_${sessionId}`;
                 const timerKey = `save_${phoneNumber}`;
                 
-                // If disconnected before 10 seconds, don't save session[cite: 5]
                 if (connectionTimers[timerKey]) {
                     const elapsed = Date.now() - connectionTimers[timerKey].startTime;
                     if (elapsed < 10000) {
@@ -927,7 +1046,7 @@ app.get('/qr', async (req, res) => {
                         delete connectionTimers[timerKey];
                     }
                     setTimeout(() => {
-                        reconnectSocket(sessionId, collection, usersCollection);
+                        reconnectSocket(sessionId, collection, usersCollection, phoneNumber);
                     }, 3000);
                 } else {
                     console.log(`[${sessionId}] Connection closed normally`);
@@ -945,9 +1064,14 @@ app.get('/qr', async (req, res) => {
 
         sock.ev.on('error', (error) => {
             console.error(`[${sessionId}] Socket error:`, error.message);
+            if (error.message && error.message.includes('Bad MAC')) {
+                const phoneNumber = sock.user?.id ? sock.user.id.split(':')[0] : 'Unknown';
+                handleBadMACError(sock, sessionId, phoneNumber);
+            }
         });
 
-        activeSockets[sessionId] = sock;
+        const socketKey = `Unknown_${sessionId}`;
+        activeSockets[socketKey] = sock;
         console.log(`[${sessionId}] Socket initialized successfully`);
 
     } catch (error) {
@@ -1023,7 +1147,6 @@ app.get('/pair', async (req, res) => {
                 const connectedNumber = sock.user?.id ? sock.user.id.split(':')[0] : sessionId;
                 console.log(`[${connectedNumber}] Connected via Pairing Code! Session: ${sessionId}`);
                 
-                // Start connection timer[cite: 5]
                 const timerKey = `save_${connectedNumber}`;
                 connectionTimers[timerKey] = {
                     startTime: Date.now(),
@@ -1032,7 +1155,6 @@ app.get('/pair', async (req, res) => {
                     sessionId: sessionId
                 };
                 
-                // Setup 10-second timer[cite: 5]
                 if (sessionTimers[timerKey]) {
                     clearTimeout(sessionTimers[timerKey]);
                 }
@@ -1080,7 +1202,6 @@ app.get('/pair', async (req, res) => {
                 const socketKey = `${phoneNumber}_${sessionId}`;
                 const timerKey = `save_${phoneNumber}`;
                 
-                // If disconnected before 10 seconds, don't save session[cite: 5]
                 if (connectionTimers[timerKey]) {
                     const elapsed = Date.now() - connectionTimers[timerKey].startTime;
                     if (elapsed < 10000) {
@@ -1118,7 +1239,7 @@ app.get('/pair', async (req, res) => {
                         delete connectionTimers[timerKey];
                     }
                     setTimeout(() => {
-                        reconnectSocket(sessionId, collection, usersCollection);
+                        reconnectSocket(sessionId, collection, usersCollection, phoneNumber);
                     }, 3000);
                 } else {
                     console.log(`[${sessionId}] Connection closed normally`);
@@ -1136,9 +1257,14 @@ app.get('/pair', async (req, res) => {
 
         sock.ev.on('error', (error) => {
             console.error(`[${sessionId}] Socket error:`, error.message);
+            if (error.message && error.message.includes('Bad MAC')) {
+                const phoneNumber = sock.user?.id ? sock.user.id.split(':')[0] : 'Unknown';
+                handleBadMACError(sock, sessionId, phoneNumber);
+            }
         });
 
-        activeSockets[sessionId] = sock;
+        const socketKey = `${phoneNumber}_${sessionId}`;
+        activeSockets[socketKey] = sock;
         console.log(`[${sessionId}] Socket initialized successfully`);
 
     } catch (error) {
@@ -1194,7 +1320,6 @@ async function cleanupAndRestart() {
                 clearTimeout(sessionTimers[key]);
                 delete sessionTimers[key];
             }
-            // Cleanup connection timers[cite: 5]
             const phoneNumber = key.split('_')[0];
             const timerKey = `save_${phoneNumber}`;
             if (connectionTimers[timerKey]) {
@@ -1238,7 +1363,7 @@ async function cleanupAndRestart() {
     }, 2000);
 }
 
-// Initialize MongoDB connection[cite: 5]
+// Initialize MongoDB connection
 console.log('Initializing MongoDB connection...');
 connectMongoDB().then(() => {
     console.log('MongoDB initialized successfully');
@@ -1255,6 +1380,7 @@ console.log('  - Server errors');
 console.log('  - Signal termination (SIGTERM/SIGINT)');
 console.log('  - High memory usage (>500MB)');
 console.log('  - WhatsApp status 515 (restart required)');
+console.log('  - Bad MAC errors (auto-recovery)');
 
 process.on('SIGTERM', async () => {
     console.log('Received SIGTERM signal. Cleaning up...');
@@ -1287,6 +1413,7 @@ const server = app.listen(PORT, () => {
     console.log(`Auto-restart enabled on errors`);
     console.log(`Session ID auto-generated for each request`);
     console.log(`WhatsApp status 515 will trigger auto-reconnect`);
+    console.log(`Bad MAC errors will trigger auto-recovery`);
 });
 
 server.on('error', async (err) => {
