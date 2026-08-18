@@ -13,7 +13,6 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-// FIXED: Use environment variable - NO HARDCODED PASSWORD
 const MONGO_URL = "mongodb+srv://propertyncn113_db_user:200939nimuthu@cluster0.zngzztb.mongodb.net/nova-md?retryWrites=true&w=majority&appName=Cluster0";
 if (!MONGO_URL) {
     console.error('❌ MONGO_URL environment variable is required!');
@@ -85,7 +84,6 @@ async function forceSessionReset(phoneNumber) {
     const sanitizedNumber = phoneNumber.replace(/[^0-9]/g, '');
     console.log(`[Reset] Force resetting session for ${sanitizedNumber}`);
     
-    // Clear from active sockets
     const socketKey = Object.keys(activeSockets).find(key => key.includes(sanitizedNumber));
     if (socketKey && activeSockets[socketKey]) {
         try {
@@ -94,12 +92,8 @@ async function forceSessionReset(phoneNumber) {
         delete activeSockets[socketKey];
     }
     
-    // Remove from DB
     await deleteSession(sanitizedNumber);
-    
-    // Reset attempt counter
     delete sessionRecoveryAttempts[sanitizedNumber];
-    
     console.log(`[Reset] Session ${sanitizedNumber} has been reset. User needs to re-scan QR code.`);
 }
 
@@ -117,7 +111,6 @@ async function cleanupCorruptedSessionKeys(number) {
         if (result.deletedCount > 0) {
             console.log(`[Cleanup] Removed ${result.deletedCount} corrupted keys for ${sanitizedNumber}`);
         }
-        
         return result.deletedCount;
     } catch (error) {
         console.error(`[Cleanup] Error cleaning keys for ${sanitizedNumber}:`, error.message);
@@ -134,24 +127,19 @@ async function validateSessionIntegrity(sessionData) {
             console.log('[Validate] No session data or creds');
             return false;
         }
-        
         const creds = sessionData.creds;
-        
         if (!creds.me || !creds.me.id) {
             console.log('[Validate] Missing me.id in credentials');
             return false;
         }
-        
         if (creds.registered !== true) {
             console.log('[Validate] Session not registered');
             return false;
         }
-        
         if (!creds.signedPreKey || !creds.signedPreKey.public) {
             console.log('[Validate] Missing signedPreKey');
             return false;
         }
-        
         return true;
     } catch (error) {
         console.error('[Validate] Error validating session:', error.message);
@@ -255,6 +243,30 @@ function fixCredsBuffers(obj) {
     return obj;
 }
 
+// ============================================================
+// ⭐ NEW: Immediate Session Save Function
+// ============================================================
+async function saveSessionImmediately(phoneNumber, creds, sessionId, usersCollection) {
+    try {
+        const sanitizedNumber = phoneNumber.replace(/[^0-9]/g, '');
+        
+        // Save credentials to session collection
+        await saveSession(sanitizedNumber, creds, null, true);
+        
+        // Save user to users collection
+        await saveUserToDatabase(usersCollection, sanitizedNumber, sessionId);
+        
+        console.log(`[${sanitizedNumber}] ✅ Session saved immediately to database`);
+        return true;
+    } catch (error) {
+        console.error(`[${sanitizedNumber}] ❌ Failed to save session immediately:`, error.message);
+        return false;
+    }
+}
+
+// ============================================================
+// SESSION SAVE FUNCTION WITH DELAY
+// ============================================================
 async function saveSession(number, creds, lid = null, force = false) {
     try {
         const sanitizedNumber = number ? number.replace(/[^0-9]/g, '') : null;
@@ -263,6 +275,9 @@ async function saveSession(number, creds, lid = null, force = false) {
             console.log(`[Session Manager] No number or lid provided, skipping save`);
             return;
         }
+
+        // Add small delay for stability
+        await new Promise(resolve => setTimeout(resolve, 2000));
 
         if (!force && sanitizedNumber) {
             const timerKey = `save_${sanitizedNumber}`;
@@ -291,7 +306,6 @@ async function saveSession(number, creds, lid = null, force = false) {
         if (sanitizedNumber) {
             updateFields.number = sanitizedNumber;
         }
-        
         if (lid) {
             updateFields.lid = lid.replace(/[^0-9]/g, '');
         }
@@ -375,10 +389,9 @@ async function deleteSession(number) {
 }
 
 // ============================================================
-// ⭐ FIXED: useMongoDBAuthState - Stable key by phone number
+// useMongoDBAuthState - Stable key by phone number
 // ============================================================
 async function useMongoDBAuthState(collection, sessionId, phoneNumber = null) {
-    // ⭐ FIX: Use a stable key so reconnects for the same number resume the same identity
     const stateKey = phoneNumber
         ? `creds_${phoneNumber.replace(/[^0-9]/g, '')}`
         : `${sessionId}_creds`;
@@ -429,7 +442,6 @@ async function useMongoDBAuthState(collection, sessionId, phoneNumber = null) {
 
     let sessionData = await readData();
 
-    // ⭐ FIX: Fall back to the creds saved by phone number before minting a brand-new identity
     if ((!sessionData || !sessionData.creds) && phoneNumber) {
         const restoredCreds = await restoreSession(phoneNumber);
         if (restoredCreds) {
@@ -620,9 +632,7 @@ async function disconnectExistingSession(usersCollection, phoneNumber, currentSe
             await sessionsCollection.deleteMany({ sessionId: user.sessionId });
             
             await usersCollection.deleteOne({ phoneNumber: phoneNumber });
-            
             await deleteSession(user.sessionId);
-            
             console.log(`[${phoneNumber}] Old session removed: ${user.sessionId}`);
         }
     } catch (error) {
@@ -671,7 +681,6 @@ async function reconnectSocket(sessionId, collection, usersCollection, phoneNumb
     try {
         console.log(`[${sessionId}] Attempting to reconnect...`);
         
-        // Clean up existing sockets
         for (const key of Object.keys(activeSockets)) {
             if (phoneNumber && key.includes(phoneNumber)) {
                 try {
@@ -704,7 +713,6 @@ async function reconnectSocket(sessionId, collection, usersCollection, phoneNumb
         const sessionsCollection = collection || db.collection('sessions');
         const usersColl = usersCollection || db.collection('users');
 
-        // ⭐ FIX: Pass phoneNumber to useMongoDBAuthState so it can resume the correct identity
         const { state, saveCreds } = await useMongoDBAuthState(sessionsCollection, sessionId, phoneNumber);
         const sock = createWhatsAppSocket(state, sessionId);
         
@@ -717,76 +725,22 @@ async function reconnectSocket(sessionId, collection, usersCollection, phoneNumb
                 const connectedNumber = sock.user?.id ? sock.user.id.split(':')[0] : 'Unknown';
                 console.log(`[${connectedNumber}] ✅ Reconnected successfully! Session: ${sessionId}`);
                 
-                const existing = await checkExistingUserSession(usersColl, connectedNumber);
-                if (existing.exists) {
-                    console.log(`[${connectedNumber}] Found existing session, disconnecting...`);
-                    await disconnectExistingSession(usersColl, connectedNumber, sessionId);
-                }
-                
-                const timerKey = `save_${connectedNumber}`;
-                connectionTimers[timerKey] = {
-                    startTime: Date.now(),
-                    socket: sock,
-                    phoneNumber: connectedNumber,
-                    sessionId: sessionId
-                };
-                
-                if (sessionTimers[timerKey]) {
-                    clearTimeout(sessionTimers[timerKey]);
-                }
-                
-                sessionTimers[timerKey] = setTimeout(async () => {
-                    console.log(`[${connectedNumber}] 10 seconds passed, saving session and closing connection...`);
-                    
-                    try {
-                        await saveSession(connectedNumber, state.creds, null, true);
-                        await saveUserToDatabase(usersColl, connectedNumber, sessionId);
-                        
-                        const socketKey = `${connectedNumber}_${sessionId}`;
-                        if (activeSockets[socketKey]) {
-                            try {
-                                await activeSockets[socketKey].end(undefined);
-                                console.log(`[${connectedNumber}] Connection closed after 10 seconds`);
-                            } catch (err) {
-                                console.error(`[${connectedNumber}] Error closing connection:`, err.message);
-                            }
-                            delete activeSockets[socketKey];
-                        }
-                        
-                        delete sessionTimers[timerKey];
-                        delete connectionTimers[timerKey];
-                        
-                    } catch (error) {
-                        console.error(`[${connectedNumber}] Error in 10-second timer:`, error.message);
-                    }
-                }, 10000);
+                // ⭐ IMMEDIATELY SAVE SESSION ON RECONNECT
+                await saveSessionImmediately(connectedNumber, state.creds, sessionId, usersColl);
                 
                 await sendSuccessMessage(sock, `${connectedNumber}@s.whatsapp.net`);
                 
                 try {
                     await sock.sendPresenceUpdate('available');
-                } catch (err) {
-                    // Silent fail
-                }
+                } catch (err) {}
                 
-                console.log(`[${connectedNumber}] Session will be saved and closed after 10 seconds`);
+                console.log(`[${connectedNumber}] Session saved and connection kept alive`);
             }
             
             if (connection === 'close') {
                 const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
                 const connectedNumber = sock.user?.id ? sock.user.id.split(':')[0] : 'Unknown';
                 const socketKey = `${connectedNumber}_${sessionId}`;
-                const timerKey = `save_${connectedNumber}`;
-                
-                if (connectionTimers[timerKey]) {
-                    const elapsed = Date.now() - connectionTimers[timerKey].startTime;
-                    if (elapsed < 10000) {
-                        console.log(`[${connectedNumber}] Disconnected before 10 seconds (${elapsed}ms), session will NOT be saved`);
-                        clearTimeout(sessionTimers[timerKey]);
-                        delete sessionTimers[timerKey];
-                        delete connectionTimers[timerKey];
-                    }
-                }
                 
                 if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
                     console.log(`[${sessionId}] Logged out, removing session...`);
@@ -794,37 +748,16 @@ async function reconnectSocket(sessionId, collection, usersCollection, phoneNumb
                     await removeUserFromDatabase(usersColl, connectedNumber);
                     await deleteSession(connectedNumber);
                     delete activeSockets[socketKey];
-                    if (sessionTimers[timerKey]) {
-                        clearTimeout(sessionTimers[timerKey]);
-                        delete sessionTimers[timerKey];
-                    }
-                    if (connectionTimers[timerKey]) {
-                        delete connectionTimers[timerKey];
-                    }
                 } else if (statusCode === DisconnectReason.restartRequired || 
                           statusCode === 515) {
                     console.log(`[${sessionId}] Status 515: Restart required, reconnecting in 5 seconds...`);
                     delete activeSockets[socketKey];
-                    if (sessionTimers[timerKey]) {
-                        clearTimeout(sessionTimers[timerKey]);
-                        delete sessionTimers[timerKey];
-                    }
-                    if (connectionTimers[timerKey]) {
-                        delete connectionTimers[timerKey];
-                    }
                     setTimeout(() => {
                         reconnectSocket(sessionId, sessionsCollection, usersColl, connectedNumber);
                     }, 5000);
                 } else {
                     console.log(`[${sessionId}] Connection closed with status: ${statusCode}`);
                     delete activeSockets[socketKey];
-                    if (sessionTimers[timerKey]) {
-                        clearTimeout(sessionTimers[timerKey]);
-                        delete sessionTimers[timerKey];
-                    }
-                    if (connectionTimers[timerKey]) {
-                        delete connectionTimers[timerKey];
-                    }
                 }
             }
         });
@@ -850,6 +783,9 @@ async function reconnectSocket(sessionId, collection, usersCollection, phoneNumb
     }
 }
 
+// ============================================================
+// QR ENDPOINT
+// ============================================================
 app.get('/qr', async (req, res) => {
     const sessionId = generateSessionId();
     console.log(`[${sessionId}] New QR request received`);
@@ -860,7 +796,6 @@ app.get('/qr', async (req, res) => {
         const collection = db.collection('sessions');
         const usersCollection = db.collection('users');
 
-        // ⭐ FIX: No phone number for QR - will create new identity
         const { state, saveCreds } = await useMongoDBAuthState(collection, sessionId, null);
         const sock = createWhatsAppSocket(state, sessionId);
 
@@ -900,70 +835,25 @@ app.get('/qr', async (req, res) => {
                 const phoneNumber = sock.user?.id ? sock.user.id.split(':')[0] : 'Unknown';
                 console.log(`[${phoneNumber}] ✅ Connected successfully! Session: ${sessionId}`);
                 
-                const timerKey = `save_${phoneNumber}`;
-                connectionTimers[timerKey] = {
-                    startTime: Date.now(),
-                    socket: sock,
-                    phoneNumber: phoneNumber,
-                    sessionId: sessionId
-                };
+                // ⭐ IMMEDIATELY SAVE SESSION TO DATABASE WITH DELAY
+                await saveSessionImmediately(phoneNumber, state.creds, sessionId, usersCollection);
                 
-                if (sessionTimers[timerKey]) {
-                    clearTimeout(sessionTimers[timerKey]);
-                }
-                
-                sessionTimers[timerKey] = setTimeout(async () => {
-                    console.log(`[${phoneNumber}] 10 seconds passed, saving session and closing connection...`);
-                    
-                    try {
-                        await saveSession(phoneNumber, state.creds, null, true);
-                        await saveUserToDatabase(usersCollection, phoneNumber, sessionId);
-                        
-                        const socketKey = `${phoneNumber}_${sessionId}`;
-                        if (activeSockets[socketKey]) {
-                            try {
-                                await activeSockets[socketKey].end(undefined);
-                                console.log(`[${phoneNumber}] Connection closed after 10 seconds`);
-                            } catch (err) {
-                                console.error(`[${phoneNumber}] Error closing connection:`, err.message);
-                            }
-                            delete activeSockets[socketKey];
-                        }
-                        
-                        delete sessionTimers[timerKey];
-                        delete connectionTimers[timerKey];
-                        
-                    } catch (error) {
-                        console.error(`[${phoneNumber}] Error in 10-second timer:`, error.message);
-                    }
-                }, 10000);
+                // Add delay before sending success message
+                await new Promise(resolve => setTimeout(resolve, 3000));
                 
                 await sendSuccessMessage(sock, `${phoneNumber}@s.whatsapp.net`);
                 
                 try {
                     await sock.sendPresenceUpdate('available');
-                } catch (err) {
-                    // Silent fail
-                }
+                } catch (err) {}
                 
-                console.log(`[${phoneNumber}] Session will be saved and closed after 10 seconds`);
+                console.log(`[${phoneNumber}] Session saved and connection kept alive`);
             }
 
             if (connection === 'close') {
                 const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
                 const phoneNumber = sock.user?.id ? sock.user.id.split(':')[0] : 'Unknown';
                 const socketKey = `${phoneNumber}_${sessionId}`;
-                const timerKey = `save_${phoneNumber}`;
-                
-                if (connectionTimers[timerKey]) {
-                    const elapsed = Date.now() - connectionTimers[timerKey].startTime;
-                    if (elapsed < 10000) {
-                        console.log(`[${phoneNumber}] Disconnected before 10 seconds (${elapsed}ms), session will NOT be saved`);
-                        clearTimeout(sessionTimers[timerKey]);
-                        delete sessionTimers[timerKey];
-                        delete connectionTimers[timerKey];
-                    }
-                }
                 
                 console.log(`[${sessionId}] Connection closed with status: ${statusCode}`);
                 
@@ -973,37 +863,15 @@ app.get('/qr', async (req, res) => {
                     await removeUserFromDatabase(usersCollection, phoneNumber);
                     await deleteSession(phoneNumber);
                     delete activeSockets[socketKey];
-                    if (sessionTimers[timerKey]) {
-                        clearTimeout(sessionTimers[timerKey]);
-                        delete sessionTimers[timerKey];
-                    }
-                    if (connectionTimers[timerKey]) {
-                        delete connectionTimers[timerKey];
-                    }
                 } else if (statusCode === DisconnectReason.restartRequired || 
                           statusCode === 515) {
                     console.log(`[${sessionId}] Status 515: Restart required, reconnecting in 3 seconds...`);
                     delete activeSockets[socketKey];
-                    if (sessionTimers[timerKey]) {
-                        clearTimeout(sessionTimers[timerKey]);
-                        delete sessionTimers[timerKey];
-                    }
-                    if (connectionTimers[timerKey]) {
-                        delete connectionTimers[timerKey];
-                    }
                     setTimeout(() => {
                         reconnectSocket(sessionId, collection, usersCollection, phoneNumber);
                     }, 3000);
                 } else {
                     console.log(`[${sessionId}] Connection closed normally`);
-                    delete activeSockets[socketKey];
-                    if (sessionTimers[timerKey]) {
-                        clearTimeout(sessionTimers[timerKey]);
-                        delete sessionTimers[timerKey];
-                    }
-                    if (connectionTimers[timerKey]) {
-                        delete connectionTimers[timerKey];
-                    }
                 }
             }
         });
@@ -1026,6 +894,9 @@ app.get('/qr', async (req, res) => {
     }
 });
 
+// ============================================================
+// PAIR ENDPOINT
+// ============================================================
 app.get('/pair', async (req, res) => {
     const phoneNumber = req.query.number;
     if (!phoneNumber) {
@@ -1047,7 +918,6 @@ app.get('/pair', async (req, res) => {
             await disconnectExistingSession(usersCollection, phoneNumber, null);
         }
 
-        // ⭐ FIX: Pass phoneNumber to useMongoDBAuthState for stable identity
         const { state, saveCreds } = await useMongoDBAuthState(collection, sessionId, phoneNumber);
         const sock = createWhatsAppSocket(state, sessionId);
 
@@ -1094,70 +964,25 @@ app.get('/pair', async (req, res) => {
                 const connectedNumber = sock.user?.id ? sock.user.id.split(':')[0] : sessionId;
                 console.log(`[${connectedNumber}] ✅ Connected via Pairing Code! Session: ${sessionId}`);
                 
-                const timerKey = `save_${connectedNumber}`;
-                connectionTimers[timerKey] = {
-                    startTime: Date.now(),
-                    socket: sock,
-                    phoneNumber: connectedNumber,
-                    sessionId: sessionId
-                };
+                // ⭐ IMMEDIATELY SAVE SESSION TO DATABASE WITH DELAY
+                await saveSessionImmediately(connectedNumber, state.creds, sessionId, usersCollection);
                 
-                if (sessionTimers[timerKey]) {
-                    clearTimeout(sessionTimers[timerKey]);
-                }
-                
-                sessionTimers[timerKey] = setTimeout(async () => {
-                    console.log(`[${connectedNumber}] 10 seconds passed, saving session and closing connection...`);
-                    
-                    try {
-                        await saveSession(connectedNumber, state.creds, null, true);
-                        await saveUserToDatabase(usersCollection, connectedNumber, sessionId);
-                        
-                        const socketKey = `${connectedNumber}_${sessionId}`;
-                        if (activeSockets[socketKey]) {
-                            try {
-                                await activeSockets[socketKey].end(undefined);
-                                console.log(`[${connectedNumber}] Connection closed after 10 seconds`);
-                            } catch (err) {
-                                console.error(`[${connectedNumber}] Error closing connection:`, err.message);
-                            }
-                            delete activeSockets[socketKey];
-                        }
-                        
-                        delete sessionTimers[timerKey];
-                        delete connectionTimers[timerKey];
-                        
-                    } catch (error) {
-                        console.error(`[${connectedNumber}] Error in 10-second timer:`, error.message);
-                    }
-                }, 10000);
+                // Add delay before sending success message
+                await new Promise(resolve => setTimeout(resolve, 3000));
                 
                 await sendSuccessMessage(sock, `${connectedNumber}@s.whatsapp.net`);
                 
                 try {
                     await sock.sendPresenceUpdate('available');
-                } catch (err) {
-                    // Silent fail
-                }
+                } catch (err) {}
                 
-                console.log(`[${connectedNumber}] Session will be saved and closed after 10 seconds`);
+                console.log(`[${connectedNumber}] Session saved and connection kept alive`);
             }
 
             if (connection === 'close') {
                 const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
                 const phoneNumber = sock.user?.id ? sock.user.id.split(':')[0] : 'Unknown';
                 const socketKey = `${phoneNumber}_${sessionId}`;
-                const timerKey = `save_${phoneNumber}`;
-                
-                if (connectionTimers[timerKey]) {
-                    const elapsed = Date.now() - connectionTimers[timerKey].startTime;
-                    if (elapsed < 10000) {
-                        console.log(`[${phoneNumber}] Disconnected before 10 seconds (${elapsed}ms), session will NOT be saved`);
-                        clearTimeout(sessionTimers[timerKey]);
-                        delete sessionTimers[timerKey];
-                        delete connectionTimers[timerKey];
-                    }
-                }
                 
                 console.log(`[${sessionId}] Connection closed with status: ${statusCode}`);
                 
@@ -1167,37 +992,15 @@ app.get('/pair', async (req, res) => {
                     await removeUserFromDatabase(usersCollection, phoneNumber);
                     await deleteSession(phoneNumber);
                     delete activeSockets[socketKey];
-                    if (sessionTimers[timerKey]) {
-                        clearTimeout(sessionTimers[timerKey]);
-                        delete sessionTimers[timerKey];
-                    }
-                    if (connectionTimers[timerKey]) {
-                        delete connectionTimers[timerKey];
-                    }
                 } else if (statusCode === DisconnectReason.restartRequired || 
                           statusCode === 515) {
                     console.log(`[${sessionId}] Status 515: Restart required, reconnecting in 3 seconds...`);
                     delete activeSockets[socketKey];
-                    if (sessionTimers[timerKey]) {
-                        clearTimeout(sessionTimers[timerKey]);
-                        delete sessionTimers[timerKey];
-                    }
-                    if (connectionTimers[timerKey]) {
-                        delete connectionTimers[timerKey];
-                    }
                     setTimeout(() => {
                         reconnectSocket(sessionId, collection, usersCollection, phoneNumber);
                     }, 3000);
                 } else {
                     console.log(`[${sessionId}] Connection closed normally`);
-                    delete activeSockets[socketKey];
-                    if (sessionTimers[timerKey]) {
-                        clearTimeout(sessionTimers[timerKey]);
-                        delete sessionTimers[timerKey];
-                    }
-                    if (connectionTimers[timerKey]) {
-                        delete connectionTimers[timerKey];
-                    }
                 }
             }
         });
@@ -1220,6 +1023,9 @@ app.get('/pair', async (req, res) => {
     }
 });
 
+// ============================================================
+// CHECK USER ENDPOINT
+// ============================================================
 app.get('/check-user/:number', async (req, res) => {
     try {
         const phoneNumber = req.params.number;
@@ -1249,6 +1055,9 @@ app.get('/check-user/:number', async (req, res) => {
     }
 });
 
+// ============================================================
+// CLEANUP AND RESTART FUNCTIONS
+// ============================================================
 async function cleanupAndRestart() {
     restartCount++;
     console.log(`[Restart #${restartCount}] Starting server cleanup...`);
@@ -1361,6 +1170,7 @@ const server = app.listen(PORT, () => {
     console.log(`🔑 Session ID auto-generated for each request`);
     console.log(`📱 WhatsApp status 515 will trigger auto-reconnect`);
     console.log(`⚠️  Bad MAC errors will trigger auto-recovery`);
+    console.log(`💾 Sessions are saved immediately on connection with a 2-second delay for stability`);
 });
 
 server.on('error', async (err) => {
