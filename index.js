@@ -1,6 +1,6 @@
 const express = require('express');
 const { MongoClient } = require('mongodb');
-const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, makeCacheableSignalKeyStore, BufferJSON } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, makeCacheableSignalKeyStore, BufferJSON } = require('@crysnovax/baileys');
 const { Boom } = require('@hapi/boom');
 const qrcode = require('qrcode');
 const P = require('pino');
